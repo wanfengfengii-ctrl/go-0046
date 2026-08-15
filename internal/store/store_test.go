@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -38,7 +39,7 @@ func reserveOp(seq int64, id string, amount int64, now time.Time) *domain.Op {
 	return &domain.Op{
 		Type:          domain.OpReserve,
 		Seq:           seq,
-		ReservationID:  id,
+		ReservationID: id,
 		CampaignID:    "c1",
 		PeriodID:      "p1",
 		Channel:       "ch1",
@@ -340,6 +341,71 @@ func TestCheckpointThenRestartResumes(t *testing.T) {
 		if r == nil {
 			t.Fatalf("reservation %s not recovered", id)
 		}
+	}
+}
+
+func TestFileReplayTornTailPreservesCommittedRecordsAcrossRestarts(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	f, err := OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	now := time.Now()
+	applyDirect(t, f, reserveOp(1, "r1", 100, now))
+	applyDirect(t, f, reserveOp(2, "r2", 100, now))
+	if err := f.Close(); err != nil {
+		t.Fatalf("close before tear: %v", err)
+	}
+
+	logPath := filepath.Join(dir, oplogFile)
+	beforeTear, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatalf("stat complete log: %v", err)
+	}
+	partial, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("open log for tear: %v", err)
+	}
+	if _, err := partial.Write([]byte{0, 0, 0, 20, 1}); err != nil {
+		partial.Close()
+		t.Fatalf("append torn frame: %v", err)
+	}
+	if err := partial.Close(); err != nil {
+		t.Fatalf("close torn log: %v", err)
+	}
+
+	f, err = OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("first recovery: %v", err)
+	}
+	if got := f.LastSeq(); got != 2 {
+		t.Fatalf("first recovered lastseq = %d, want 2", got)
+	}
+	if r, err := f.GetReservation(context.Background(), "r2"); err != nil || r == nil {
+		t.Fatalf("first recovery lost r2: reservation=%+v err=%v", r, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close after first recovery: %v", err)
+	}
+	afterFirst, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatalf("stat after first recovery: %v", err)
+	}
+	if afterFirst.Size() != beforeTear.Size() {
+		t.Fatalf("recovery truncated complete log: size=%d, want %d", afterFirst.Size(), beforeTear.Size())
+	}
+
+	f, err = OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("second recovery: %v", err)
+	}
+	defer f.Close()
+	if got := f.LastSeq(); got != 2 {
+		t.Fatalf("second recovered lastseq = %d, want 2", got)
+	}
+	if r, err := f.GetReservation(context.Background(), "r2"); err != nil || r == nil {
+		t.Fatalf("second recovery lost r2: reservation=%+v err=%v", r, err)
 	}
 }
 
