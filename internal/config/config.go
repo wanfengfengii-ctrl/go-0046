@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"time"
 )
@@ -44,10 +45,10 @@ type Config struct {
 
 // Campaign is a single advertiser campaign with its three-tier budget tree.
 type Campaign struct {
-	ID          string   `json:"id"`
-	LimitMicros int64    `json:"limit_micros"`
-	BurstMicros int64    `json:"burst_micros"`
-	Periods     []Period `json:"periods"`
+	ID          string    `json:"id"`
+	LimitMicros int64     `json:"limit_micros"`
+	BurstMicros int64     `json:"burst_micros"`
+	Periods     []Period  `json:"periods"`
 	Channels    []Channel `json:"channels"`
 }
 
@@ -100,6 +101,13 @@ func Load(path string) (*Config, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
+	}
+	var extra interface{}
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("decode config: trailing JSON value")
+		}
+		return nil, fmt.Errorf("decode config: trailing data: %w", err)
 	}
 	if err := c.Validate(); err != nil {
 		return nil, err

@@ -161,3 +161,44 @@ func TestConfigLoadRejectsUnknownField(t *testing.T) {
 		t.Fatal("expected unknown-field error")
 	}
 }
+
+func TestConfigLoadRejectsTrailingJSONValue(t *testing.T) {
+	cases := []struct {
+		name      string
+		suffix    string
+		wantError bool
+	}{
+		{name: "single object", suffix: "", wantError: false},
+		{name: "trailing whitespace", suffix: " \n\t", wantError: false},
+		{name: "trailing object", suffix: ` {"unexpected":true}`, wantError: true},
+		{name: "trailing array", suffix: " []", wantError: true},
+		{name: "trailing string", suffix: ` "unexpected"`, wantError: true},
+		{name: "trailing number", suffix: " 42", wantError: true},
+	}
+	data := mustMarshalJSON(t, validConfig())
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.json")
+			if err := writeFile(path, append(data, []byte(tc.suffix)...)); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			loaded, err := Load(path)
+			if tc.wantError {
+				if err == nil {
+					t.Fatal("expected trailing JSON value error")
+				}
+				if loaded != nil {
+					t.Fatalf("loaded partial config: %+v", loaded)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if loaded == nil || loaded.Version != validConfig().Version {
+				t.Fatalf("loaded mismatch: %+v", loaded)
+			}
+		})
+	}
+}
