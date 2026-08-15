@@ -161,3 +161,69 @@ func TestConfigLoadRejectsUnknownField(t *testing.T) {
 		t.Fatal("expected unknown-field error")
 	}
 }
+
+// TestConfigLoadAcceptsTrailingWhitespace verifies that whitespace after the
+// single top-level JSON document is accepted (the file is still a single
+// config).
+func TestConfigLoadAcceptsTrailingWhitespace(t *testing.T) {
+	base := mustMarshalJSON(t, validConfig())
+	cases := [][]byte{
+		[]byte(""),
+		[]byte(" "),
+		[]byte("\n"),
+		[]byte("\r\n\t "),
+		[]byte("\n\n\n"),
+	}
+	for i, extra := range cases {
+		data := append(append([]byte{}, base...), extra...)
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.json")
+		if err := writeFile(path, data); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		loaded, err := Load(path)
+		if err != nil {
+			t.Fatalf("case %d (%q): load with trailing whitespace: %v", i, extra, err)
+		}
+		if loaded.Version != validConfig().Version {
+			t.Fatalf("case %d: loaded version = %d, want %d", i, loaded.Version, validConfig().Version)
+		}
+	}
+}
+
+// TestConfigLoadRejectsTrailingJSON verifies that any non-whitespace content
+// after the first complete JSON document is rejected, covering concatenated
+// objects, arrays, scalars, and stray delimiters. This is the regression test
+// for the silent acceptance of a trailing second JSON document.
+func TestConfigLoadRejectsTrailingJSON(t *testing.T) {
+	base := mustMarshalJSON(t, validConfig())
+	cases := []struct {
+		name  string
+		extra []byte
+	}{
+		{"trailing object", []byte(`{"version":2}`)},
+		{"trailing object after newline", []byte("\n{\"version\":2}")},
+		{"trailing array", []byte(`[1,2,3]`)},
+		{"trailing number", []byte(`123`)},
+		{"trailing string", []byte(`"extra"`)},
+		{"trailing bool", []byte(`true`)},
+		{"trailing null", []byte(`null`)},
+		{"trailing garbage", []byte(`@@@`)},
+		{"trailing closing brace", []byte(`}`)},
+		{"trailing closing bracket", []byte(`]`)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := append(append([]byte{}, base...), ' ')
+			data = append(data, tc.extra...)
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.json")
+			if err := writeFile(path, data); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatalf("expected error for %s, got nil", tc.name)
+			}
+		})
+	}
+}

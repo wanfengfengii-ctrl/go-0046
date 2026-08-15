@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"time"
 )
@@ -100,6 +101,15 @@ func Load(path string) (*Config, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
+	}
+	// A config file must contain exactly one top-level JSON value followed by
+	// only whitespace. Reject concatenated or trailing content (a second
+	// object, array, scalar, or stray delimiter) so malformed or accidentally
+	// joined configs are caught at the startup boundary rather than silently
+	// using the first value. dec.Token returns io.EOF only when no further
+	// non-whitespace content remains.
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("config: unexpected trailing data after JSON document")
 	}
 	if err := c.Validate(); err != nil {
 		return nil, err
