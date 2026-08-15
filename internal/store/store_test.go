@@ -367,6 +367,117 @@ func TestConfigVersionMismatchFails(t *testing.T) {
 	}
 }
 
+func TestOpLogSpansCheckpointAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	f, err := OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	ctx := context.Background()
+	now := time.Now()
+	// Commit several ops and confirm OpLog returns the complete records.
+	for i := 0; i < 3; i++ {
+		op := reserveOp(int64(i+1), "r"+string(rune('1'+i)), 100, now)
+		op.Digest = [32]byte{byte(i + 1)}
+		applyDirect(t, f, op)
+	}
+	livePre, err := f.OpLog(ctx, 0, 0)
+	if err != nil {
+		t.Fatalf("live oplog: %v", err)
+	}
+	if len(livePre) != 3 {
+		t.Fatalf("live oplog len = %d, want 3", len(livePre))
+	}
+	// Write a checkpoint covering these sequence numbers.
+	ckptSeq, err := f.Checkpoint(ctx)
+	if err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if ckptSeq != 3 {
+		t.Fatalf("checkpoint seq = %d, want 3", ckptSeq)
+	}
+	// Add ops after the checkpoint boundary so the reopened log spans it.
+	for i := 0; i < 2; i++ {
+		op := reserveOp(int64(i+4), "r"+string(rune('4'+i)), 100, now)
+		op.Digest = [32]byte{byte(i + 4)}
+		applyDirect(t, f, op)
+	}
+	liveFull, err := f.OpLog(ctx, 0, 0)
+	if err != nil {
+		t.Fatalf("live oplog full: %v", err)
+	}
+	if len(liveFull) != 5 {
+		t.Fatalf("live oplog full len = %d, want 5", len(liveFull))
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Reopen: LastSeq and business state recover correctly, and the same
+	// after/limit query must still return the full history, including the
+	// committed records that predate the checkpoint boundary.
+	f2, err := OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer f2.Close()
+	if got := f2.LastSeq(); got != 5 {
+		t.Fatalf("recovered lastseq = %d, want 5", got)
+	}
+
+	recoveredFull, err := f2.OpLog(ctx, 0, 0)
+	if err != nil {
+		t.Fatalf("recovered oplog full: %v", err)
+	}
+	if len(recoveredFull) != 5 {
+		t.Fatalf("recovered oplog full len = %d, want 5 (history before checkpoint must remain visible)", len(recoveredFull))
+	}
+	for i, op := range recoveredFull {
+		wantSeq := int64(i + 1)
+		if op.Seq != wantSeq {
+			t.Fatalf("recovered op[%d].Seq = %d, want %d", i, op.Seq, wantSeq)
+		}
+		if op.ReservationID != "r"+string(rune('1'+i)) {
+			t.Fatalf("recovered op[%d].ReservationID = %q", i, op.ReservationID)
+		}
+		if op.Result == nil || !op.Result.OK {
+			t.Fatalf("recovered op[%d].Result missing/not ok", i)
+		}
+	}
+
+	// The same after/limit query that worked live must return identical
+	// records after restart — restart must not change read-only history.
+	recoveredPre, err := f2.OpLog(ctx, 0, 3)
+	if err != nil {
+		t.Fatalf("recovered oplog pre: %v", err)
+	}
+	if len(recoveredPre) != 3 {
+		t.Fatalf("recovered oplog pre len = %d, want 3", len(recoveredPre))
+	}
+	for i := range livePre {
+		if recoveredPre[i].Seq != livePre[i].Seq {
+			t.Fatalf("pre-checkpoint op[%d].Seq: recovered=%d live=%d", i, recoveredPre[i].Seq, livePre[i].Seq)
+		}
+		if recoveredPre[i].ReservationID != livePre[i].ReservationID {
+			t.Fatalf("pre-checkpoint op[%d].ReservationID: recovered=%q live=%q", i, recoveredPre[i].ReservationID, livePre[i].ReservationID)
+		}
+	}
+
+	// after pointing at the checkpoint boundary must return exactly the
+	// post-checkpoint tail.
+	recoveredTail, err := f2.OpLog(ctx, ckptSeq, 0)
+	if err != nil {
+		t.Fatalf("recovered oplog tail: %v", err)
+	}
+	if len(recoveredTail) != 2 {
+		t.Fatalf("recovered oplog tail len = %d, want 2", len(recoveredTail))
+	}
+	if recoveredTail[0].Seq != 4 || recoveredTail[1].Seq != 5 {
+		t.Fatalf("recovered oplog tail seqs = %d,%d, want 4,5", recoveredTail[0].Seq, recoveredTail[1].Seq)
+	}
+}
+
 func applyDirect(t *testing.T, s Store, op *domain.Op) {
 	t.Helper()
 	_, _, err := s.Apply(context.Background(), func(st *domain.State) (*Action, error) {

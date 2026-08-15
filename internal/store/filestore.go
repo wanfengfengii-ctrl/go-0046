@@ -157,8 +157,12 @@ func (f *File) replay(lf *os.File) error {
 			return fmt.Errorf("oplog: decode frame at offset %d: %v", lastGood, err)
 		}
 		if op.Seq <= f.state.LastSeq {
-			// Pre-checkpoint entry: already captured in checkpoint state. Skip
-			// application but still validate the frame hash (done above).
+			// Pre-checkpoint entry: already captured in checkpoint state, so
+			// skip application but still validate the frame hash (done above).
+			// Keep an in-memory copy so the read-only ops endpoint returns the
+			// full committed history across the checkpoint boundary after a
+			// restart — the frames remain valid on disk and must stay visible.
+			f.log = append(f.log, op)
 			lastGood = n
 			continue
 		}
