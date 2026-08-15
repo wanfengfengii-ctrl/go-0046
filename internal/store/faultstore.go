@@ -41,14 +41,29 @@ func (f *Fault) Arm(mode FaultMode) {
 	f.mode.Store(int32(mode))
 }
 
-// takeAndArm returns the armed mode and clears it (one-shot).
-func (f *Fault) take() FaultMode {
-	return FaultMode(f.mode.Swap(int32(FaultNone)))
+// take returns and clears the armed mode if it matches one of modes.
+func (f *Fault) take(modes ...FaultMode) FaultMode {
+	for {
+		armed := FaultMode(f.mode.Load())
+		matched := false
+		for _, mode := range modes {
+			if armed == mode {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return FaultNone
+		}
+		if f.mode.CompareAndSwap(int32(armed), int32(FaultNone)) {
+			return armed
+		}
+	}
 }
 
 // Apply delegates to the inner store, injecting the armed fault.
 func (f *Fault) Apply(ctx context.Context, fn ApplyFn) (int64, *domain.OpResult, error) {
-	mode := f.take()
+	mode := f.take(FaultBeforeCommit, FaultAfterCommitLoseResponse)
 	if mode == FaultBeforeCommit {
 		// Run the decision function to observe its result, then fail before
 		// any mutation. We snapshot to read state without committing.
@@ -104,7 +119,7 @@ func (f *Fault) GetIdempotency(ctx context.Context, key string) (*domain.IdemRec
 
 // Checkpoint delegates to the inner store, injecting FaultCheckpoint.
 func (f *Fault) Checkpoint(ctx context.Context) (int64, error) {
-	if f.take() == FaultCheckpoint {
+	if f.take(FaultCheckpoint) == FaultCheckpoint {
 		return 0, domain.NewError(domain.CodeInternal, "injected: checkpoint failure")
 	}
 	return f.inner.Checkpoint(ctx)

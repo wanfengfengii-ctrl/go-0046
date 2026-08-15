@@ -166,6 +166,61 @@ func TestFaultAfterCommitLoseResponseRecoverable(t *testing.T) {
 	}
 }
 
+func TestFaultRetainsArmedModeUntilMatchingOperation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+
+	t.Run("checkpoint fault", func(t *testing.T) {
+		mem := NewMemory(BuildState(testConfig()))
+		fs := NewFault(mem)
+		fs.Arm(FaultCheckpoint)
+
+		if _, _, err := fs.Apply(ctx, func(st *domain.State) (*Action, error) {
+			return CommitAction(reserveOp(0, "r1", 100, now)), nil
+		}); err != nil {
+			t.Fatalf("unrelated apply: %v", err)
+		}
+		if _, err := fs.Checkpoint(ctx); !domain.IsDomainError(err, domain.CodeInternal) {
+			t.Fatalf("checkpoint error = %v, want injected internal error", err)
+		}
+		if _, err := fs.Checkpoint(ctx); err != nil {
+			t.Fatalf("checkpoint after one-shot fault: %v", err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name                string
+		mode                FaultMode
+		committedAfterFault int64
+	}{
+		{name: "before commit fault", mode: FaultBeforeCommit, committedAfterFault: 0},
+		{name: "after commit fault", mode: FaultAfterCommitLoseResponse, committedAfterFault: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := NewMemory(BuildState(testConfig()))
+			fs := NewFault(mem)
+			fs.Arm(tc.mode)
+
+			if _, err := fs.Checkpoint(ctx); err != nil {
+				t.Fatalf("unrelated checkpoint: %v", err)
+			}
+			if _, _, err := fs.Apply(ctx, func(st *domain.State) (*Action, error) {
+				return CommitAction(reserveOp(0, "r1", 100, now)), nil
+			}); !domain.IsDomainError(err, domain.CodeInternal) {
+				t.Fatalf("apply error = %v, want injected internal error", err)
+			}
+			if got := mem.LastSeq(); got != tc.committedAfterFault {
+				t.Fatalf("lastseq after fault = %d, want %d", got, tc.committedAfterFault)
+			}
+			if _, _, err := fs.Apply(ctx, func(st *domain.State) (*Action, error) {
+				return CommitAction(reserveOp(0, "r2", 100, now)), nil
+			}); err != nil {
+				t.Fatalf("apply after one-shot fault: %v", err)
+			}
+		})
+	}
+}
+
 func TestFaultCheckpointFailureLeavesOldIntact(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig()
