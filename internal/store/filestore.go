@@ -31,9 +31,9 @@ const (
 // subsequent log, rebuilding identical state.
 type File struct {
 	baseStore
-	dir   string
-	mu    sync.Mutex // shadows baseStore.mu; File uses its own lock discipline
-	f     *os.File   // oplog handle, opened for append
+	dir string
+	mu  sync.Mutex // shadows baseStore.mu; File uses its own lock discipline
+	f   *os.File   // oplog handle, opened for append
 }
 
 // checkpoint is the on-disk checkpoint document.
@@ -158,7 +158,9 @@ func (f *File) replay(lf *os.File) error {
 		}
 		if op.Seq <= f.state.LastSeq {
 			// Pre-checkpoint entry: already captured in checkpoint state. Skip
-			// application but still validate the frame hash (done above).
+			// application but still validate the frame hash (done above). Keep it
+			// in the in-memory log so OpLog remains complete after restart.
+			f.log = append(f.log, op)
 			lastGood = n
 			continue
 		}

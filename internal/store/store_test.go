@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -38,7 +39,7 @@ func reserveOp(seq int64, id string, amount int64, now time.Time) *domain.Op {
 	return &domain.Op{
 		Type:          domain.OpReserve,
 		Seq:           seq,
-		ReservationID:  id,
+		ReservationID: id,
 		CampaignID:    "c1",
 		PeriodID:      "p1",
 		Channel:       "ch1",
@@ -340,6 +341,63 @@ func TestCheckpointThenRestartResumes(t *testing.T) {
 		if r == nil {
 			t.Fatalf("reservation %s not recovered", id)
 		}
+	}
+}
+
+func TestFileOpLogPreservedAcrossCheckpointRestart(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	f, err := OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	for i := 1; i <= 2; i++ {
+		op := reserveOp(int64(i), "r"+string(rune('0'+i)), 100, now)
+		op.Digest = [32]byte{byte(i)}
+		applyDirect(t, f, op)
+	}
+	beforeCheckpoint, err := f.OpLog(ctx, 0, 10)
+	if err != nil {
+		t.Fatalf("oplog before checkpoint: %v", err)
+	}
+	if len(beforeCheckpoint) != 2 || beforeCheckpoint[0].Seq != 1 || beforeCheckpoint[1].Seq != 2 {
+		t.Fatalf("oplog before checkpoint = %+v, want seqs 1, 2", beforeCheckpoint)
+	}
+	if _, err := f.Checkpoint(ctx); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	op3 := reserveOp(3, "r3", 100, now)
+	op3.Digest = [32]byte{3}
+	applyDirect(t, f, op3)
+	live, err := f.OpLog(ctx, 0, 10)
+	if err != nil {
+		t.Fatalf("oplog before restart: %v", err)
+	}
+	if len(live) != 3 {
+		t.Fatalf("oplog before restart has %d ops, want 3", len(live))
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	f2, err := OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer f2.Close()
+	recovered, err := f2.OpLog(ctx, 0, 10)
+	if err != nil {
+		t.Fatalf("oplog after restart: %v", err)
+	}
+	if !reflect.DeepEqual(recovered, live) {
+		t.Fatalf("oplog after restart = %+v, want %+v", recovered, live)
+	}
+	if got, err := f2.OpLog(ctx, 1, 2); err != nil {
+		t.Fatalf("oplog after restart with after/limit: %v", err)
+	} else if len(got) != 2 || got[0].Seq != 2 || got[1].Seq != 3 {
+		t.Fatalf("oplog after restart with after/limit = %+v, want seqs 2, 3", got)
 	}
 }
 
