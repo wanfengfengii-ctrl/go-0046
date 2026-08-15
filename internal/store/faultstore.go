@@ -25,10 +25,20 @@ const (
 )
 
 // Fault wraps a Store and injects deterministic failures. It is safe for
-// concurrent use. Each injected fault fires exactly once.
+// concurrent use. Each injected fault fires exactly once, on the next
+// operation that matches the fault's type.
+//
+// Apply-type faults (FaultBeforeCommit, FaultAfterCommitLoseResponse) and
+// the Checkpoint-type fault (FaultCheckpoint) are tracked independently. An
+// armed fault is retained until an operation of its own type consumes it,
+// so an intervening operation of a different type does not clear it: e.g.
+// a FaultCheckpoint armed before an Apply is not swallowed by that Apply and
+// still fires on the next Checkpoint, and an Apply-type fault is not
+// swallowed by an unrelated Checkpoint. Each fault fires exactly once.
 type Fault struct {
-	inner Store
-	mode  atomic.Int32 // FaultMode
+	inner     Store
+	applyMode atomic.Int32 // FaultNone | FaultBeforeCommit | FaultAfterCommitLoseResponse
+	ckptArmed atomic.Bool  // FaultCheckpoint armed
 }
 
 // NewFault wraps inner with a fault-injecting store.
@@ -36,19 +46,39 @@ func NewFault(inner Store) *Fault {
 	return &Fault{inner: inner}
 }
 
-// Arm sets the fault to inject on the next matching operation.
+// Arm sets the fault to inject on the next matching operation. The fault is
+// retained until an operation of its own type consumes it. Arming an
+// Apply-type fault replaces any previously armed Apply-type fault; arming
+// FaultCheckpoint sets the checkpoint fault independently. Arm(FaultNone)
+// disarms any pending fault of both types.
 func (f *Fault) Arm(mode FaultMode) {
-	f.mode.Store(int32(mode))
+	switch mode {
+	case FaultBeforeCommit, FaultAfterCommitLoseResponse:
+		f.applyMode.Store(int32(mode))
+	case FaultCheckpoint:
+		f.ckptArmed.Store(true)
+	default: // FaultNone: disarm everything.
+		f.applyMode.Store(int32(FaultNone))
+		f.ckptArmed.Store(false)
+	}
 }
 
-// takeAndArm returns the armed mode and clears it (one-shot).
-func (f *Fault) take() FaultMode {
-	return FaultMode(f.mode.Swap(int32(FaultNone)))
+// takeApply returns the armed Apply-type fault and clears it (one-shot).
+func (f *Fault) takeApply() FaultMode {
+	return FaultMode(f.applyMode.Swap(int32(FaultNone)))
 }
 
-// Apply delegates to the inner store, injecting the armed fault.
+// takeCheckpoint reports whether the checkpoint fault was armed and clears
+// it (one-shot).
+func (f *Fault) takeCheckpoint() bool {
+	return f.ckptArmed.Swap(false)
+}
+
+// Apply delegates to the inner store, injecting the armed Apply-type fault.
+// It does not touch an armed Checkpoint-type fault, which is retained for the
+// next Checkpoint.
 func (f *Fault) Apply(ctx context.Context, fn ApplyFn) (int64, *domain.OpResult, error) {
-	mode := f.take()
+	mode := f.takeApply()
 	if mode == FaultBeforeCommit {
 		// Run the decision function to observe its result, then fail before
 		// any mutation. We snapshot to read state without committing.
@@ -102,9 +132,10 @@ func (f *Fault) GetIdempotency(ctx context.Context, key string) (*domain.IdemRec
 	return f.inner.GetIdempotency(ctx, key)
 }
 
-// Checkpoint delegates to the inner store, injecting FaultCheckpoint.
+// Checkpoint delegates to the inner store, injecting FaultCheckpoint. It does
+// not touch an armed Apply-type fault, which is retained for the next Apply.
 func (f *Fault) Checkpoint(ctx context.Context) (int64, error) {
-	if f.take() == FaultCheckpoint {
+	if f.takeCheckpoint() {
 		return 0, domain.NewError(domain.CodeInternal, "injected: checkpoint failure")
 	}
 	return f.inner.Checkpoint(ctx)

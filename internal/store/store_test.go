@@ -377,3 +377,189 @@ func applyDirect(t *testing.T, s Store, op *domain.Op) {
 		t.Fatalf("apply op %s: %v", op.ReservationID, err)
 	}
 }
+
+// commitOp returns a decision function that commits op (using the store's
+// PrevHash) without any idempotency/replay logic. Used by the fault tests.
+func commitOp(op *domain.Op) ApplyFn {
+	return func(st *domain.State) (*Action, error) {
+		op.PrevHash = st.LastHash
+		return CommitAction(op), nil
+	}
+}
+
+// TestFaultCheckpointSurvivesInterveningApply covers the headline bug: a
+// FaultCheckpoint armed before a normal Apply must not be cleared by that
+// Apply, so the next Checkpoint still fails.
+func TestFaultCheckpointSurvivesInterveningApply(t *testing.T) {
+	mem := NewMemory(BuildState(testConfig()))
+	fs := NewFault(mem)
+	ctx := context.Background()
+	now := time.Now()
+
+	fs.Arm(FaultCheckpoint)
+	// A normal Apply must NOT consume the checkpoint fault.
+	if _, _, err := fs.Apply(ctx, commitOp(reserveOp(0, "r1", 100, now))); err != nil {
+		t.Fatalf("apply should succeed: %v", err)
+	}
+	if got := mem.LastSeq(); got != 1 {
+		t.Fatalf("lastseq = %d, want 1 (apply should have committed)", got)
+	}
+	// The checkpoint fault must still fire on the next Checkpoint.
+	if _, err := fs.Checkpoint(ctx); err == nil {
+		t.Fatal("expected checkpoint failure after intervening apply")
+	} else if !domain.IsDomainError(err, domain.CodeInternal) {
+		t.Fatalf("expected internal injected error, got %v", err)
+	}
+}
+
+// TestFaultBeforeCommitSurvivesInterveningCheckpoint verifies an Apply-type
+// fault is not swallowed by an unrelated Checkpoint call.
+func TestFaultBeforeCommitSurvivesInterveningCheckpoint(t *testing.T) {
+	mem := NewMemory(BuildState(testConfig()))
+	fs := NewFault(mem)
+	ctx := context.Background()
+	now := time.Now()
+
+	fs.Arm(FaultBeforeCommit)
+	// An unrelated Checkpoint must NOT consume the before-commit fault.
+	if _, err := fs.Checkpoint(ctx); err != nil {
+		t.Fatalf("checkpoint should succeed: %v", err)
+	}
+	// The before-commit fault must still fire on the next Apply.
+	_, _, err := fs.Apply(ctx, commitOp(reserveOp(0, "r1", 100, now)))
+	if err == nil {
+		t.Fatal("expected before-commit failure after intervening checkpoint")
+	}
+	if !domain.IsDomainError(err, domain.CodeInternal) {
+		t.Fatalf("expected internal injected error, got %v", err)
+	}
+	// Before-commit semantics: no state mutation occurred.
+	if got := mem.LastSeq(); got != 0 {
+		t.Fatalf("lastseq = %d, want 0", got)
+	}
+}
+
+// TestFaultAfterCommitLoseResponseSurvivesInterveningCheckpoint verifies the
+// second Apply-type fault is also not swallowed by an unrelated Checkpoint.
+func TestFaultAfterCommitLoseResponseSurvivesInterveningCheckpoint(t *testing.T) {
+	mem := NewMemory(BuildState(testConfig()))
+	fs := NewFault(mem)
+	ctx := context.Background()
+	now := time.Now()
+	rid := "r1"
+	rqid := "rq1"
+	op := reserveOp(0, rid, 100, now)
+	op.RequestID = rqid
+	op.Digest = domain.ReserveInput{RequestID: rqid, CampaignID: "c1", Channel: "ch1", Amount: 100}.Digest()
+
+	fs.Arm(FaultAfterCommitLoseResponse)
+	// An unrelated Checkpoint must NOT consume the lose-response fault.
+	if _, err := fs.Checkpoint(ctx); err != nil {
+		t.Fatalf("checkpoint should succeed: %v", err)
+	}
+	// The lose-response fault must still fire on the next Apply.
+	_, _, err := fs.Apply(ctx, func(st *domain.State) (*Action, error) {
+		if rec := st.IdemRecord("reserve:" + rqid); rec != nil {
+			return NoOpAction(rec.Result), nil
+		}
+		return CommitAction(op), nil
+	})
+	if err == nil {
+		t.Fatal("expected lost-response error after intervening checkpoint")
+	}
+	// The op was committed despite the lost response.
+	if got := mem.LastSeq(); got != 1 {
+		t.Fatalf("lastseq = %d, want 1", got)
+	}
+}
+
+// TestFaultCheckpointFiresOnce verifies one-shot semantics for the checkpoint
+// fault: it fails the first matching Checkpoint and lets the second succeed.
+func TestFaultCheckpointFiresOnce(t *testing.T) {
+	mem := NewMemory(BuildState(testConfig()))
+	fs := NewFault(mem)
+	ctx := context.Background()
+
+	fs.Arm(FaultCheckpoint)
+	if _, err := fs.Checkpoint(ctx); err == nil {
+		t.Fatal("expected first checkpoint failure")
+	}
+	// Second checkpoint must succeed: the fault fires exactly once.
+	if _, err := fs.Checkpoint(ctx); err != nil {
+		t.Fatalf("second checkpoint should succeed: %v", err)
+	}
+}
+
+// TestFaultBeforeCommitFiresOnce verifies one-shot semantics for an Apply-type
+// fault: it fails the first Apply and lets the second succeed.
+func TestFaultBeforeCommitFiresOnce(t *testing.T) {
+	mem := NewMemory(BuildState(testConfig()))
+	fs := NewFault(mem)
+	ctx := context.Background()
+	now := time.Now()
+
+	fs.Arm(FaultBeforeCommit)
+	if _, _, err := fs.Apply(ctx, commitOp(reserveOp(0, "r1", 100, now))); err == nil {
+		t.Fatal("expected first apply failure")
+	}
+	// Second apply must succeed: the fault fires exactly once.
+	if _, _, err := fs.Apply(ctx, commitOp(reserveOp(0, "r2", 100, now))); err != nil {
+		t.Fatalf("second apply should succeed: %v", err)
+	}
+	if got := mem.LastSeq(); got != 1 {
+		t.Fatalf("lastseq = %d, want 1", got)
+	}
+}
+
+// TestFaultApplyAndCheckpointIndependent arms both fault types at once and
+// verifies each fires only on its matching operation, leaving the other armed,
+// and that both are spent after their respective operations.
+func TestFaultApplyAndCheckpointIndependent(t *testing.T) {
+	mem := NewMemory(BuildState(testConfig()))
+	fs := NewFault(mem)
+	ctx := context.Background()
+	now := time.Now()
+
+	// Arm both an Apply-type fault and a Checkpoint-type fault.
+	fs.Arm(FaultBeforeCommit)
+	fs.Arm(FaultCheckpoint)
+
+	// Apply must fire the before-commit fault and leave the checkpoint armed.
+	if _, _, err := fs.Apply(ctx, commitOp(reserveOp(0, "r1", 100, now))); err == nil {
+		t.Fatal("expected before-commit failure on apply")
+	}
+	// Checkpoint must still fire (not consumed by the apply above).
+	if _, err := fs.Checkpoint(ctx); err == nil {
+		t.Fatal("expected checkpoint failure after apply consumed apply-fault")
+	}
+	// Both faults are now spent: a second apply and checkpoint must succeed.
+	if _, _, err := fs.Apply(ctx, commitOp(reserveOp(0, "r2", 100, now))); err != nil {
+		t.Fatalf("second apply should succeed: %v", err)
+	}
+	if _, err := fs.Checkpoint(ctx); err != nil {
+		t.Fatalf("second checkpoint should succeed: %v", err)
+	}
+	if got := mem.LastSeq(); got != 1 {
+		t.Fatalf("lastseq = %d, want 1", got)
+	}
+}
+
+// TestArmNoneDisarmsPendingFaults verifies Arm(FaultNone) clears pending
+// faults of both types so neither fires on the next matching operation.
+func TestArmNoneDisarmsPendingFaults(t *testing.T) {
+	mem := NewMemory(BuildState(testConfig()))
+	fs := NewFault(mem)
+	ctx := context.Background()
+	now := time.Now()
+
+	fs.Arm(FaultBeforeCommit)
+	fs.Arm(FaultCheckpoint)
+	fs.Arm(FaultNone) // disarm both pending faults.
+
+	if _, _, err := fs.Apply(ctx, commitOp(reserveOp(0, "r1", 100, now))); err != nil {
+		t.Fatalf("apply should succeed after disarm: %v", err)
+	}
+	if _, err := fs.Checkpoint(ctx); err != nil {
+		t.Fatalf("checkpoint should succeed after disarm: %v", err)
+	}
+}
