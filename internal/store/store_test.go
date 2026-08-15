@@ -2,8 +2,11 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,7 +41,7 @@ func reserveOp(seq int64, id string, amount int64, now time.Time) *domain.Op {
 	return &domain.Op{
 		Type:          domain.OpReserve,
 		Seq:           seq,
-		ReservationID:  id,
+		ReservationID: id,
 		CampaignID:    "c1",
 		PeriodID:      "p1",
 		Channel:       "ch1",
@@ -340,6 +343,67 @@ func TestCheckpointThenRestartResumes(t *testing.T) {
 		if r == nil {
 			t.Fatalf("reservation %s not recovered", id)
 		}
+	}
+}
+
+func TestCheckpointRejectsCorruptIdempotencyRecord(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	f, err := OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	op := reserveOp(1, "r1", 100, now)
+	op.RequestID = "rq1"
+	op.Digest = domain.ReserveInput{RequestID: "rq1", CampaignID: "c1", Channel: "ch1", Amount: 100}.Digest()
+	applyDirect(t, f, op)
+	if _, err := f.Checkpoint(context.Background()); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	f2, err := OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("reopen valid checkpoint: %v", err)
+	}
+	record, ok := f2.GetIdempotency(context.Background(), "reserve:rq1")
+	if !ok || record.Result == nil || record.Result.ReservationID != "r1" {
+		t.Fatalf("recovered idempotency record = %+v", record)
+	}
+	if err := f2.Close(); err != nil {
+		t.Fatalf("close valid restart: %v", err)
+	}
+
+	path := filepath.Join(dir, checkpointFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read checkpoint: %v", err)
+	}
+	var ck checkpoint
+	if err := json.Unmarshal(data, &ck); err != nil {
+		t.Fatalf("decode checkpoint: %v", err)
+	}
+	state, err := domain.DecodeState(ck.State)
+	if err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+	state.IdemRecord("reserve:rq1").Result.ReservationID = "corrupted-rid"
+	ck.State, err = domain.EncodeState(state)
+	if err != nil {
+		t.Fatalf("encode state: %v", err)
+	}
+	data, err = json.Marshal(ck)
+	if err != nil {
+		t.Fatalf("encode checkpoint: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write checkpoint: %v", err)
+	}
+
+	if _, err := OpenFile(dir, cfg); err == nil || !strings.Contains(err.Error(), "summary hash mismatch") {
+		t.Fatalf("expected summary hash mismatch, got %v", err)
 	}
 }
 

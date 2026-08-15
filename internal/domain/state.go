@@ -31,12 +31,12 @@ type State struct {
 
 // stateJSON is the serializable projection of State.
 type stateJSON struct {
-	Ledgers       []*Ledger             `json:"ledgers"`
+	Ledgers       []*Ledger               `json:"ledgers"`
 	Reservations  map[string]*Reservation `json:"reservations"`
 	Idempotency   map[string]*IdemRecord  `json:"idempotency"`
-	LastSeq       int64                 `json:"last_seq"`
-	LastHash      [32]byte              `json:"last_hash"`
-	ConfigVersion int64                 `json:"config_version"`
+	LastSeq       int64                   `json:"last_seq"`
+	LastHash      [32]byte                `json:"last_hash"`
+	ConfigVersion int64                   `json:"config_version"`
 }
 
 // MarshalJSON implements json.Marshaler.
@@ -85,9 +85,9 @@ func (s *State) UnmarshalJSON(data []byte) error {
 // NewState returns an empty state pinned to configVersion.
 func NewState(configVersion int64) *State {
 	return &State{
-		Ledgers:      make(map[LedgerKey]*Ledger),
-		Reservations: make(map[string]*Reservation),
-		Idempotency:  make(map[string]*IdemRecord),
+		Ledgers:       make(map[LedgerKey]*Ledger),
+		Reservations:  make(map[string]*Reservation),
+		Idempotency:   make(map[string]*IdemRecord),
 		ConfigVersion: configVersion,
 	}
 }
@@ -377,8 +377,8 @@ func (s *State) Validate() error {
 }
 
 // SummaryHash returns a canonical hash of the state, used to detect checkpoint
-// corruption. It hashes the chain cursor, config version, and sorted ledger
-// and reservation snapshots.
+// corruption. It hashes the chain cursor, config version, and sorted ledger,
+// reservation, and idempotency snapshots.
 func (s *State) SummaryHash() [32]byte {
 	h := sha256.New()
 	var lb [8]byte
@@ -420,9 +420,50 @@ func (s *State) SummaryHash() [32]byte {
 		writeI64(h, r.RefundedAmount)
 		writeI64(h, int64(r.State))
 	}
+	keys = keys[:0]
+	for k := range s.Idempotency {
+		keys = append(keys, LedgerKey{CampaignID: k})
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].CampaignID < keys[j].CampaignID })
+	for _, k := range keys {
+		key := k.CampaignID
+		r := s.Idempotency[key]
+		writeStr(h, key)
+		if r == nil {
+			writeI64(h, 0)
+			continue
+		}
+		writeI64(h, 1)
+		writeStr(h, r.Key)
+		writeI64(h, int64(r.Kind))
+		h.Write(r.Digest[:])
+		writeI64(h, r.Seq)
+		writeStr(h, r.ReservationID)
+		writeI64(h, r.CreatedAt.UnixNano())
+		if r.Result == nil {
+			writeI64(h, 0)
+			continue
+		}
+		writeI64(h, 1)
+		writeI64(h, boolInt(r.Result.OK))
+		writeStr(h, r.Result.Code)
+		writeStr(h, r.Result.ReservationID)
+		writeI64(h, int64(r.Result.State))
+		writeI64(h, r.Result.Amount)
+		writeI64(h, r.Result.ConfirmedAmount)
+		writeI64(h, r.Result.RefundedAmount)
+		writeI64(h, r.Result.Seq)
+	}
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
 	return out
+}
+
+func boolInt(v bool) int64 {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 func ledgerKeyLess(a, b LedgerKey) bool {
