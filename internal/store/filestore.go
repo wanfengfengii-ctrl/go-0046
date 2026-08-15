@@ -159,7 +159,7 @@ func (f *File) replay(lf *os.File) error {
 		if op.Seq <= f.state.LastSeq {
 			// Pre-checkpoint entry: already captured in checkpoint state. Skip
 			// application but still validate the frame hash (done above).
-			lastGood = n
+			lastGood += n
 			continue
 		}
 		if op.Seq != expectedSeq+1 {
@@ -178,7 +178,7 @@ func (f *File) replay(lf *os.File) error {
 		f.state.LastHash = frame.hash
 		// Keep an in-memory copy for the ops endpoint.
 		f.log = append(f.log, op)
-		lastGood = n
+		lastGood += n
 	}
 }
 
@@ -190,9 +190,10 @@ type rawFrame struct {
 var errTornFrame = errors.New("torn frame")
 
 // readFrame reads one length-prefixed frame. It returns the computed hash, the
-// payload, the stored hash, the byte offset past the frame, and an error. A
-// clean EOF at a frame boundary returns io.EOF; a partial frame returns
-// errTornFrame.
+// payload, the stored hash, the byte length of the frame (4 + payload + 32),
+// and an error. Callers that need the offset past the frame must accumulate
+// this length themselves. A clean EOF at a frame boundary returns io.EOF; a
+// partial frame returns errTornFrame.
 func readFrame(r io.Reader) (rawFrame, []byte, [32]byte, int64, error) {
 	var lenBuf [4]byte
 	n, err := io.ReadFull(r, lenBuf[:])

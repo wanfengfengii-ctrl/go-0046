@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -375,5 +377,113 @@ func applyDirect(t *testing.T, s Store, op *domain.Op) {
 	})
 	if err != nil {
 		t.Fatalf("apply op %s: %v", op.ReservationID, err)
+	}
+}
+
+// fileSize returns the current size of the file at path, failing the test on
+// error.
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return fi.Size()
+}
+
+// TestFileReplayTruncatesOnlyTornTail reproduces a torn-tail recovery bug: when
+// the oplog already holds at least two complete committed frames and then a
+// crash appends an incomplete final frame, recovery must discard ONLY that
+// incomplete tail. Previously the truncation offset was computed from the last
+// frame's length rather than the cumulative byte offset, so the first recovery
+// truncated the log to the wrong position; a second restart then lost the last
+// complete committed record (and its reservation) and rolled the sequence
+// number back. Complete, hash-valid history must survive across restarts.
+func TestFileReplayTruncatesOnlyTornTail(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	f, err := OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	ctx := context.Background()
+	now := time.Now()
+	// Two complete committed records.
+	op1 := reserveOp(1, "r1", 100, now)
+	op1.Digest = [32]byte{1}
+	applyDirect(t, f, op1)
+	op2 := reserveOp(2, "r2", 200, now)
+	op2.Digest = [32]byte{2}
+	applyDirect(t, f, op2)
+	if got := f.LastSeq(); got != 2 {
+		t.Fatalf("lastseq = %d, want 2", got)
+	}
+	// Clean log size = exactly the two complete frames, before any torn tail.
+	cleanSize := fileSize(t, filepath.Join(dir, oplogFile))
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Append a torn tail frame: a length prefix that promises a payload which
+	// never fully follows. This simulates a crash mid-write.
+	logPath := filepath.Join(dir, oplogFile)
+	torn, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("open oplog for torn append: %v", err)
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], 1000) // claims a 1000-byte payload
+	if _, err := torn.Write(lenBuf[:]); err != nil {
+		t.Fatalf("write torn length prefix: %v", err)
+	}
+	if _, err := torn.Write([]byte{0xAA, 0xBB, 0xCC}); err != nil { // only 3 bytes follow
+		t.Fatalf("write torn body: %v", err)
+	}
+	if err := torn.Close(); err != nil {
+		t.Fatalf("close torn: %v", err)
+	}
+	if got := fileSize(t, logPath); got != cleanSize+4+3 {
+		t.Fatalf("torn append size = %d, want %d", got, cleanSize+4+3)
+	}
+
+	// First recovery: must see all complete records and truncate ONLY the torn
+	// tail, restoring the clean log size.
+	f2, err := OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("reopen1: %v", err)
+	}
+	if got := f2.LastSeq(); got != 2 {
+		t.Fatalf("recover1 lastseq = %d, want 2", got)
+	}
+	if r, _ := f2.GetReservation(ctx, "r1"); r == nil {
+		t.Fatal("recover1: r1 missing")
+	}
+	if r, _ := f2.GetReservation(ctx, "r2"); r == nil {
+		t.Fatal("recover1: r2 missing")
+	}
+	if got := fileSize(t, logPath); got != cleanSize {
+		t.Fatalf("recover1 log size = %d, want clean %d (torn tail not truncated to correct boundary)", got, cleanSize)
+	}
+	if err := f2.Close(); err != nil {
+		t.Fatalf("close2: %v", err)
+	}
+
+	// Second recovery: complete, hash-valid history must persist across restarts.
+	f3, err := OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("reopen2: %v", err)
+	}
+	defer f3.Close()
+	if got := f3.LastSeq(); got != 2 {
+		t.Fatalf("recover2 lastseq = %d, want 2 (last committed record lost across restarts)", got)
+	}
+	if r, _ := f3.GetReservation(ctx, "r1"); r == nil {
+		t.Fatal("recover2: r1 missing")
+	}
+	if r, _ := f3.GetReservation(ctx, "r2"); r == nil {
+		t.Fatal("recover2: r2 missing (last committed reservation lost across restarts)")
+	}
+	if got := fileSize(t, logPath); got != cleanSize {
+		t.Fatalf("recover2 log size = %d, want clean %d", got, cleanSize)
 	}
 }
