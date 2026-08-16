@@ -303,3 +303,122 @@ func TestStateSummaryHashStable(t *testing.T) {
 		t.Fatal("different states have identical summary hashes")
 	}
 }
+
+// newStateWithIdem builds a state with one reserve idempotency record whose
+// cached result carries a booking identifier, the value that must be protected
+// against silent corruption.
+func newStateWithIdem() *State {
+	s := newStateWithLedgers()
+	now := time.Date(2026, 1, 1, 0, 5, 0, 0, time.UTC)
+	op := &Op{
+		Type: OpReserve, Seq: 1, ReservationID: "r1", CampaignID: "c1", PeriodID: "p1", Channel: "ch1",
+		Amount: 100, Now: now, ExpiresAt: now.Add(time.Minute), Digest: [32]byte{0xAA},
+		Result: &OpResult{OK: true, Code: CodeOK, ReservationID: "r1", Amount: 100, State: StateReserved},
+	}
+	op.PrevHash = s.LastHash
+	if err := s.Apply(op); err != nil {
+		panic(err)
+	}
+	return s
+}
+
+// TestSummaryHashCoversIdempotencyResult verifies that corrupting any
+// replay-semantic field of an idempotency record changes the summary hash, so
+// the checkpoint integrity check rejects it at startup. This is the regression
+// test for the bug where a parseable change to the cached booking identifier
+// left the recorded summary hash unchanged and the corrupted checkpoint was
+// accepted.
+func TestSummaryHashCoversIdempotencyResult(t *testing.T) {
+	base := newStateWithIdem()
+	want := base.SummaryHash()
+
+	cases := []struct {
+		name   string
+		mutate func(*IdemRecord)
+	}{
+		{
+			"corrupted booking id",
+			func(r *IdemRecord) { r.Result.ReservationID = "rX" },
+		},
+		{
+			"corrupted result ok",
+			func(r *IdemRecord) { r.Result.OK = false },
+		},
+		{
+			"corrupted result code",
+			func(r *IdemRecord) { r.Result.Code = CodeInternal },
+		},
+		{
+			"corrupted result amount",
+			func(r *IdemRecord) { r.Result.Amount = 999 },
+		},
+		{
+			"corrupted request digest",
+			func(r *IdemRecord) { r.Digest[0] ^= 0xFF },
+		},
+		{
+			"corrupted reservation id",
+			func(r *IdemRecord) { r.ReservationID = "rX" },
+		},
+		{
+			"corrupted kind",
+			func(r *IdemRecord) { r.Kind = IdemSettle },
+		},
+		{
+			"corrupted seq",
+			func(r *IdemRecord) { r.Seq = 999 },
+		},
+		{
+			"corrupted key",
+			func(r *IdemRecord) { r.Key = "reserve:other" },
+		},
+		{
+			"dropped result",
+			func(r *IdemRecord) { r.Result = nil },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := base.Clone()
+			// Locate the single idempotency record (Clone copied it deeply,
+			// including Result, so mutation is isolated to s).
+			var rec *IdemRecord
+			for _, r := range s.Idempotency {
+				rec = r
+			}
+			if rec == nil {
+				t.Fatal("missing idempotency record")
+			}
+			tc.mutate(rec)
+			if got := s.SummaryHash(); got == want {
+				t.Fatalf("summary hash unchanged after %s: got %x want %x",
+					tc.name, got, want)
+			}
+		})
+	}
+}
+
+// TestSummaryHashRoundTripsCheckpoint verifies that a valid checkpoint
+// round-trips through JSON without changing the summary hash, so the integrity
+// check passes on a normal restart. This guards against the fix accidentally
+// including a field (such as a timestamp) whose JSON representation is not
+// stable across marshal/unmarshal.
+func TestSummaryHashRoundTripsCheckpoint(t *testing.T) {
+	s := newStateWithIdem()
+	liveHash := s.SummaryHash()
+
+	data, err := EncodeState(s)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	decoded, err := DecodeState(data)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// Restore the chain cursor the way loadCheckpoint does: EncodeState
+	// serializes LastSeq/LastHash, and DecodeState restores them.
+	if got := decoded.SummaryHash(); got != liveHash {
+		t.Fatalf("summary hash changed across checkpoint round-trip: got %x want %x",
+			got, liveHash)
+	}
+}

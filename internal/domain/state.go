@@ -377,8 +377,16 @@ func (s *State) Validate() error {
 }
 
 // SummaryHash returns a canonical hash of the state, used to detect checkpoint
-// corruption. It hashes the chain cursor, config version, and sorted ledger
-// and reservation snapshots.
+// corruption. It hashes the chain cursor, config version, and sorted ledger,
+// reservation, and idempotency snapshots.
+//
+// Idempotency records are covered in full: the cached Result (including the
+// booking identifier returned on replay), the request Digest used to detect
+// conflicting retries, and the structural fields. A corrupted idempotent
+// return value therefore changes the summary hash and is rejected at startup,
+// rather than silently replaying a broken result. Only the metadata-only
+// CreatedAt field is excluded, matching the reservation snapshot which omits
+// timestamps.
 func (s *State) SummaryHash() [32]byte {
 	h := sha256.New()
 	var lb [8]byte
@@ -420,9 +428,51 @@ func (s *State) SummaryHash() [32]byte {
 		writeI64(h, r.RefundedAmount)
 		writeI64(h, int64(r.State))
 	}
+	idemKeys := make([]string, 0, len(s.Idempotency))
+	for k := range s.Idempotency {
+		idemKeys = append(idemKeys, k)
+	}
+	sort.Strings(idemKeys)
+	for _, k := range idemKeys {
+		r := s.Idempotency[k]
+		// Hash both the map key (used for replay lookup) and the record's own
+		// Key field (a redundant copy that callers may read); a mismatch
+		// between the two, or corruption of either, must change the hash.
+		writeStr(h, k)
+		writeStr(h, r.Key)
+		writeI64(h, int64(r.Kind))
+		h.Write(r.Digest[:])
+		writeI64(h, r.Seq)
+		writeStr(h, r.ReservationID)
+		writeOpResultHash(h, r.Result)
+	}
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
 	return out
+}
+
+// writeOpResultHash folds an idempotent op result into the summary hash. The
+// flag distinguishes a present result from an absent one so that corrupting a
+// nil result into a non-nil one (or vice versa) also changes the hash. Every
+// field is a stable JSON type, so the value survives checkpoint round-trips.
+func writeOpResultHash(h interface{ Write([]byte) (int, error) }, r *OpResult) {
+	if r == nil {
+		writeI64(h, 0)
+		return
+	}
+	writeI64(h, 1)
+	var ok int64
+	if r.OK {
+		ok = 1
+	}
+	writeI64(h, ok)
+	writeStr(h, r.Code)
+	writeStr(h, r.ReservationID)
+	writeI64(h, int64(r.State))
+	writeI64(h, r.Amount)
+	writeI64(h, r.ConfirmedAmount)
+	writeI64(h, r.RefundedAmount)
+	writeI64(h, r.Seq)
 }
 
 func ledgerKeyLess(a, b LedgerKey) bool {

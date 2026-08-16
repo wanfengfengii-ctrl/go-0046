@@ -1,8 +1,11 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -340,6 +343,211 @@ func TestCheckpointThenRestartResumes(t *testing.T) {
 		if r == nil {
 			t.Fatalf("reservation %s not recovered", id)
 		}
+	}
+}
+
+// corruptCheckpointJSON rewrites the checkpoint file at dir by applying mutate
+// to its raw JSON bytes. It fails the test if mutate does not change the bytes,
+// so a test cannot silently pass against an uncorrupted file.
+func corruptCheckpointJSON(t *testing.T, dir string, mutate func([]byte) []byte) {
+	t.Helper()
+	path := filepath.Join(dir, checkpointFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read checkpoint: %v", err)
+	}
+	changed := mutate(data)
+	if string(changed) == string(data) {
+		t.Fatalf("corruption did not alter checkpoint json")
+	}
+	if err := os.WriteFile(path, changed, 0o644); err != nil {
+		t.Fatalf("write checkpoint: %v", err)
+	}
+}
+
+// TestCheckpointRejectsCorruptIdempotencyResult is the regression test for the
+// bug where a parseable change to the cached booking identifier in a
+// checkpoint's idempotency record left the recorded summary hash unchanged, so
+// startup accepted the corrupted checkpoint and replays returned a broken
+// reservation id. Startup must refuse to run on such partially-trusted state.
+func TestCheckpointRejectsCorruptIdempotencyResult(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	f, err := OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	ctx := context.Background()
+	now := time.Now()
+	op := reserveOp(1, "r1", 100, now)
+	op.RequestID = "rq1"
+	op.Digest = domain.ReserveInput{RequestID: "rq1", CampaignID: "c1", Channel: "ch1", Amount: 100}.Digest()
+	if _, _, err := f.Apply(ctx, func(st *domain.State) (*Action, error) {
+		op.PrevHash = st.LastHash
+		return CommitAction(op), nil
+	}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if _, err := f.Checkpoint(ctx); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Flip the cached booking id in the idempotency record (MarshalIndent
+	// emits "reservation_id": "r1"); the change is valid JSON, so only the
+	// summary hash can catch it.
+	corruptCheckpointJSON(t, dir, func(b []byte) []byte {
+		return bytes.Replace(b, []byte(`"reservation_id": "r1"`), []byte(`"reservation_id": "rEVIL"`), 1)
+	})
+
+	f2, err := OpenFile(dir, cfg)
+	if err == nil {
+		// If startup wrongly accepted the checkpoint, the replayed result
+		// must not carry the corrupted id.
+		rec, ok := f2.GetIdempotency(ctx, "reserve:rq1")
+		f2.Close()
+		if ok && rec != nil && rec.Result != nil && rec.Result.ReservationID == "rEVIL" {
+			t.Fatal("startup accepted checkpoint with corrupted idempotency result")
+		}
+		t.Fatal("expected startup to reject checkpoint with corrupted idempotency result")
+	}
+}
+
+// TestCheckpointRejectsCorruptIdempotencyDigest verifies that corrupting the
+// request digest stored on an idempotency record (used to detect conflicting
+// retries) is also rejected at startup, since it affects replay semantics.
+func TestCheckpointRejectsCorruptIdempotencyDigest(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	f, err := OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	ctx := context.Background()
+	now := time.Now()
+	op := reserveOp(1, "r1", 100, now)
+	op.RequestID = "rq1"
+	op.Digest = domain.ReserveInput{RequestID: "rq1", CampaignID: "c1", Channel: "ch1", Amount: 100}.Digest()
+	if _, _, err := f.Apply(ctx, func(st *domain.State) (*Action, error) {
+		op.PrevHash = st.LastHash
+		return CommitAction(op), nil
+	}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if _, err := f.Checkpoint(ctx); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// The digest is a 32-byte JSON array; flip the first element. Locate the
+	// idempotency record's digest by rewriting the substring that follows the
+	// record key.
+	corruptCheckpointJSON(t, dir, func(b []byte) []byte {
+		// The record carries Result with reservation_id "r1"; the digest array
+		// appears earlier in the record. Replace the leading [N, of the digest
+		// following the reservation_id of the reserve op payload. To stay
+		// robust, flip the first numeric entry of the digest array by turning
+		// a leading 0 element into 255.
+		idx := bytes.Index(b, []byte(`"digest": [`))
+		if idx < 0 {
+			idx = bytes.Index(b, []byte(`"digest":[`))
+		}
+		if idx < 0 {
+			t.Fatalf("digest array not found in checkpoint json")
+		}
+		// Find the first digit after the bracket.
+		rest := b[idx:]
+		bi := bytes.IndexByte(rest, '[')
+		start := idx + bi + 1
+		// Skip whitespace.
+		for start < len(b) && (b[start] == ' ' || b[start] == '\n' || b[start] == '\t') {
+			start++
+		}
+		if start >= len(b) || b[start] < '0' || b[start] > '9' {
+			t.Fatalf("could not locate digest first element")
+		}
+		// Parse the integer, flip all bits, rewrite.
+		end := start
+		for end < len(b) && b[end] >= '0' && b[end] <= '9' {
+			end++
+		}
+		var n int
+		fmt.Sscanf(string(b[start:end]), "%d", &n)
+		out := append([]byte{}, b[:start]...)
+		out = append(out, []byte(fmt.Sprintf("%d", n^0xFF))...)
+		out = append(out, b[end:]...)
+		return out
+	})
+
+	if _, err := OpenFile(dir, cfg); err == nil {
+		t.Fatal("expected startup to reject checkpoint with corrupted idempotency digest")
+	}
+}
+
+// TestCheckpointNormalRestartReplaysIdempotency verifies the happy path: after a
+// clean checkpoint and restart, an idempotent retry of a committed request
+// returns the original result (correct booking id) without a new commit.
+func TestCheckpointNormalRestartReplaysIdempotency(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+	f, err := OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	ctx := context.Background()
+	now := time.Now()
+	op := reserveOp(1, "r1", 100, now)
+	op.RequestID = "rq1"
+	op.Digest = domain.ReserveInput{RequestID: "rq1", CampaignID: "c1", Channel: "ch1", Amount: 100}.Digest()
+	if _, _, err := f.Apply(ctx, func(st *domain.State) (*Action, error) {
+		if rec := st.IdemRecord("reserve:rq1"); rec != nil {
+			return NoOpAction(rec.Result), nil
+		}
+		op.PrevHash = st.LastHash
+		return CommitAction(op), nil
+	}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	liveSeq := f.LastSeq()
+	if _, err := f.Checkpoint(ctx); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Restart from the valid checkpoint.
+	f2, err := OpenFile(dir, cfg)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer f2.Close()
+	if got := f2.LastSeq(); got != liveSeq {
+		t.Fatalf("lastseq = %d, want %d", got, liveSeq)
+	}
+	// Idempotent retry: must return the cached result, not re-commit.
+	seq2, res2, err := f2.Apply(ctx, func(st *domain.State) (*Action, error) {
+		rec := st.IdemRecord("reserve:rq1")
+		if rec == nil {
+			return nil, errors.New("idempotency record not recovered")
+		}
+		return NoOpAction(rec.Result), nil
+	})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if seq2 != 0 {
+		t.Fatalf("retry committed a new op: seq %d", seq2)
+	}
+	if res2 == nil || res2.ReservationID != "r1" || res2.Amount != 100 {
+		t.Fatalf("replay result = %+v, want reservation r1 amount 100", res2)
+	}
+	if got := f2.LastSeq(); got != liveSeq {
+		t.Fatalf("lastseq changed after replay: %d, want %d", got, liveSeq)
 	}
 }
 
